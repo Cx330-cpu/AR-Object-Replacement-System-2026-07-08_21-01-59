@@ -12,6 +12,12 @@ The module is isolated under `detection/` and exposes the required interface:
 detect(frame) -> list[DetectionResult]
 ```
 
+This implementation follows the current product interaction rule:
+
+- The visualization always draws a crosshair at the screen center.
+- Detection post-processing returns only the object at the screen center.
+- Non-center objects are ignored even if their confidence is higher.
+
 ## Implemented Tasks
 
 | Task | Status | Files |
@@ -39,8 +45,13 @@ Configurable fields include:
 - Confidence threshold
 - NMS IoU threshold
 - Max detections
-- Device
+- Device (`auto` selects CUDA, then Apple MPS, then CPU)
+- Inference image size
+- Half precision toggle for CUDA
 - Class names
+- Center-only detection switch
+- Center region ratio
+- Crosshair style
 - Log level
 - Log file
 
@@ -64,16 +75,42 @@ Run benchmark with mock frames:
 python3 scripts/benchmark_detection.py
 ```
 
+Check the active detection environment and GPU backend:
+
+```bash
+conda run -n Object_detection_system python scripts/check_detection_environment.py
+```
+
 Run 100-image metric evaluation with mock annotations:
 
 ```bash
 python3 scripts/evaluate_detection.py
 ```
 
-Run realtime camera demo after placing YOLO weights at `Assets/models/yolov8n.pt`:
+Run realtime camera demo after placing YOLO weights at `Assets/models/yolov8n.pt` or the CoreML export at `Assets/models/yolov8n.mlpackage`:
 
 ```bash
 python3 app/detection_demo.py
+```
+
+When using the Anaconda environment prepared for this project:
+
+```bash
+bash scripts/run_detection_demo.sh
+```
+
+On Apple Silicon Macs, PyTorch MPS may be unavailable on newer macOS builds. In that case export and use the CoreML model:
+
+```bash
+YOLO_CONFIG_DIR=.ultralytics conda run -n Object_detection_system yolo export model=Assets/models/yolov8n.pt format=coreml imgsz=640
+```
+
+Force a specific device when needed:
+
+```bash
+python3 app/detection_demo.py --device mps
+python3 app/detection_demo.py --device cuda
+python3 app/detection_demo.py --device cpu
 ```
 
 ## Current Acceptance Result

@@ -19,6 +19,32 @@
 /[Ll]ogs/
 /[Uu]ser[Ss]ettings/
 *.log
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.venv/
+venv/
+
+# ML models, datasets, and generated experiment outputs
+/Assets/models/*
+!/Assets/models/.gitkeep
+/datasets/
+/data/
+/outputs/
+/runs/
+/wandb/
+/.ultralytics/
+*.pt
+*.pth
+*.onnx
+*.engine
 
 # By default unity supports Blender asset imports, *.blend1 blender files do not need to be committed to version control.
 *.blend1
@@ -41,6 +67,7 @@
 
 # Visual Studio cache directory
 .vs/
+.vscode/
 
 # Gradle cache directory
 .gradle/
