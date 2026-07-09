@@ -18,6 +18,19 @@ namespace ARObjectReplacement.Geometry
                 (screenHeight - screenPixel.y) * cameraResolution.y / screenHeight);
         }
 
+        public static Vector2 ImagePixelToCameraPixel(
+            Vector2 imagePixel,
+            Vector2Int imageResolution,
+            Vector2Int cameraResolution)
+        {
+            var imageWidth = Mathf.Max(1, imageResolution.x);
+            var imageHeight = Mathf.Max(1, imageResolution.y);
+
+            return new Vector2(
+                imagePixel.x * cameraResolution.x / imageWidth,
+                imagePixel.y * cameraResolution.y / imageHeight);
+        }
+
         public static Vector3 PixelToCameraPoint(
             Vector2 cameraPixel,
             float depthMeters,

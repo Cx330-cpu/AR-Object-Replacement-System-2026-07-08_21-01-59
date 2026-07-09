@@ -125,6 +125,29 @@ The module passes local mock-based M1 verification:
 - Visualization entrypoint: implemented
 - Realtime YOLO demo: implemented, requires dependencies, camera, and local model weights
 
+## iPhone Runtime Integration
+
+M1 is also integrated into the Unity iOS runtime:
+
+- CoreML model: `Assets/models/yolov8n.mlpackage`
+- Native plugin: `Assets/Plugins/iOS/YoloCoreMLPlugin.mm`
+- Unity wrapper: `Assets/Scripts/Detection/YoloCoreMLDetector.cs`
+- ROI integration: `Assets/Scripts/Demo/PointCloudCaptureDemo.cs`
+
+The native plugin loads YOLO through CoreML/Vision with `MLComputeUnitsAll`, allowing iOS to use device acceleration such as Neural Engine and GPU instead of the Python CPU pipeline.
+
+The runtime behavior is:
+
+```text
+ARCamera CPU Image
+↓
+CoreML/Vision YOLO on iPhone
+↓
+Center target BoundingBox
+↓
+M4 PointCloud ROI
+```
+
 ## Remaining Real-World Validation
 
 The milestone requires real model and dataset validation before research acceptance:

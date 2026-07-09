@@ -44,8 +44,8 @@ namespace ARObjectReplacement.Geometry
         private void Awake()
         {
             arCamera = arCamera != null ? arCamera : Camera.main;
-            CreateSphere();
             CreateControls();
+            CreateSphere();
         }
 
         private void Update()
@@ -109,16 +109,80 @@ namespace ARObjectReplacement.Geometry
 
         private void CreateSphere()
         {
-            sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            sphere = new GameObject("M3 WorldPoint Sphere");
+            var meshFilter = sphere.AddComponent<MeshFilter>();
+            meshFilter.sharedMesh = CreateSphereMesh();
+            sphereRenderer = sphere.AddComponent<MeshRenderer>();
             sphere.name = "M3 WorldPoint Sphere";
             sphere.transform.localScale = Vector3.one * sphereDiameterMeters;
-            sphereRenderer = sphere.GetComponent<Renderer>();
             if (sphereRenderer != null)
             {
-                sphereRenderer.material.color = new Color(0.62f, 0.2f, 1f, 1f);
+                var shader = Shader.Find("Unlit/Color");
+                if (shader == null)
+                {
+                    shader = Shader.Find("Universal Render Pipeline/Unlit");
+                }
+
+                if (shader == null)
+                {
+                    shader = Shader.Find("Standard");
+                }
+
+                if (shader != null)
+                {
+                    sphereRenderer.sharedMaterial = new Material(shader);
+                    sphereRenderer.sharedMaterial.color = new Color(0.62f, 0.2f, 1f, 1f);
+                }
             }
 
             SetSphereVisible(false);
+        }
+
+        private static Mesh CreateSphereMesh(int longitudeSegments = 24, int latitudeSegments = 16)
+        {
+            var vertices = new Vector3[(latitudeSegments + 1) * (longitudeSegments + 1)];
+            var triangles = new int[latitudeSegments * longitudeSegments * 6];
+
+            var vertexIndex = 0;
+            for (var lat = 0; lat <= latitudeSegments; lat++)
+            {
+                var theta = Mathf.PI * lat / latitudeSegments;
+                var sinTheta = Mathf.Sin(theta);
+                var cosTheta = Mathf.Cos(theta);
+
+                for (var lon = 0; lon <= longitudeSegments; lon++)
+                {
+                    var phi = 2f * Mathf.PI * lon / longitudeSegments;
+                    vertices[vertexIndex++] = new Vector3(
+                        0.5f * sinTheta * Mathf.Cos(phi),
+                        0.5f * cosTheta,
+                        0.5f * sinTheta * Mathf.Sin(phi));
+                }
+            }
+
+            var triangleIndex = 0;
+            for (var lat = 0; lat < latitudeSegments; lat++)
+            {
+                for (var lon = 0; lon < longitudeSegments; lon++)
+                {
+                    var current = lat * (longitudeSegments + 1) + lon;
+                    var next = current + longitudeSegments + 1;
+
+                    triangles[triangleIndex++] = current;
+                    triangles[triangleIndex++] = next;
+                    triangles[triangleIndex++] = current + 1;
+                    triangles[triangleIndex++] = current + 1;
+                    triangles[triangleIndex++] = next;
+                    triangles[triangleIndex++] = next + 1;
+                }
+            }
+
+            var mesh = new Mesh { name = "M3 Visual Sphere Mesh" };
+            mesh.vertices = vertices;
+            mesh.triangles = triangles;
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            return mesh;
         }
 
         private void UpdateSphere(WorldPoint worldPoint, bool smooth)

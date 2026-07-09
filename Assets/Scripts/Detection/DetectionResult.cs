@@ -1,0 +1,17 @@
+using System;
+using UnityEngine;
+
+namespace ARObjectReplacement.Detection
+{
+    [Serializable]
+    public struct DetectionResult
+    {
+        public bool IsValid;
+        public Rect PixelRect;
+        public int ClassId;
+        public float Confidence;
+        public double Timestamp;
+
+        public Vector2 Center => new Vector2(PixelRect.x + PixelRect.width * 0.5f, PixelRect.y + PixelRect.height * 0.5f);
+    }
+}
