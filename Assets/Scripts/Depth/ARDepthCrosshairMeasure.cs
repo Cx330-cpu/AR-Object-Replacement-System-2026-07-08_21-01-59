@@ -21,6 +21,7 @@ namespace ARObjectReplacement.Depth
         [SerializeField] private float smoothing = 0.25f;
 
         [Header("UI")]
+        [SerializeField] private bool showCrosshair = false;
         [SerializeField] private bool showHeatMap = false;
         [SerializeField] private int heatMapWidth = 160;
         [SerializeField] private int heatMapHeight = 120;
@@ -272,7 +273,10 @@ namespace ARObjectReplacement.Depth
             canvas.gameObject.AddComponent<GraphicRaycaster>();
             DontDestroyOnLoad(canvas.gameObject);
 
-            CreateCrosshair(canvas.transform);
+            if (showCrosshair)
+            {
+                CreateCrosshair(canvas.transform);
+            }
             distanceText = CreateDistanceText(canvas.transform);
             heatMapImage = CreateHeatMap(canvas.transform);
         }

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using ARObjectReplacement.Detection;
 using ARObjectReplacement.PointCloud;
+using ARObjectReplacement.Pose;
 using Unity.Collections;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -19,6 +20,7 @@ namespace ARObjectReplacement.Demo
     {
         [SerializeField] private ARCameraManager cameraManager;
         [SerializeField] private AROcclusionManager occlusionManager;
+        [SerializeField] private ARPlaneManager planeManager;
         [SerializeField] private int roiWidth = 120;
         [SerializeField] private int roiHeight = 120;
         [SerializeField] private float voxelSizeMeters = 0.01f;
@@ -27,27 +29,47 @@ namespace ARObjectReplacement.Demo
         [SerializeField] private float minimumConfidence = 0.5f;
         [SerializeField] private float outlierRadiusMeters = 0.035f;
         [SerializeField] private int outlierMinimumNeighbors = 2;
+        [SerializeField] private float yoloRoiExpandRatio = 0.04f;
         [SerializeField] private int maxVisualPoints = 2500;
         [SerializeField] private float pointVisualSizeMeters = 0.006f;
         [SerializeField] private bool realtimeYoloEnabled = true;
         [SerializeField] private float realtimeYoloIntervalSeconds = 0.5f;
+        [SerializeField] private bool realtimeDirectionEnabled = true;
+        [SerializeField] private float realtimeDirectionIntervalSeconds = 0.5f;
+        [SerializeField] private float directionAxisLengthMeters = 0.12f;
+        [SerializeField] private float directionAxisThicknessMeters = 0.008f;
+        [SerializeField] private float targetCenterSphereDiameterMeters = 0.045f;
         [SerializeField] private int yoloInputWidth = 640;
         [SerializeField] private int yoloInputHeight = 480;
+        [SerializeField] private RuntimePoseMode runtimePoseMode = RuntimePoseMode.Auto;
+        [SerializeField] private bool surfaceForwardFacesCamera = true;
+        [SerializeField] private GenericPoseConfig genericPoseConfig = new GenericPoseConfig();
 
         private readonly PointCloudBuilder builder = new PointCloudBuilder();
         private readonly PointCloudDownSampler downSampler = new PointCloudDownSampler();
         private readonly PointCloudCleaner cleaner = new PointCloudCleaner();
         private readonly PointCloudExporter exporter = new PointCloudExporter();
         private readonly YoloCoreMLDetector detector = new YoloCoreMLDetector();
+        private readonly GenericPoseEstimator genericPoseEstimator = new GenericPoseEstimator();
+        private readonly GenericPoseStabilizer genericPoseStabilizer = new GenericPoseStabilizer();
         private Text statusText;
+        private Text directionText;
         private GameObject pointCloudVisual;
         private MeshFilter pointCloudMeshFilter;
         private MeshRenderer pointCloudRenderer;
+        private GameObject directionAxisRoot;
+        private LineRenderer directionAxisMajor;
+        private LineRenderer directionAxisMiddle;
+        private LineRenderer directionAxisNormal;
+        private GameObject targetCenterSphere;
+        private MeshRenderer targetCenterSphereRenderer;
         private RectTransform detectionBox;
         private Text detectionText;
         private bool hasLatestDetection;
         private DetectionResult latestDetection;
         private float lastRealtimeYoloTime;
+        private float lastRealtimeDirectionTime;
+        private float lastGenericPoseLogTime;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Install()
@@ -90,18 +112,50 @@ namespace ARObjectReplacement.Demo
                 occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
             }
 
+            EnsurePlaneManager();
             CreateControls();
+        }
+
+        private void EnsurePlaneManager()
+        {
+            if (planeManager == null)
+            {
+                planeManager = FindObjectOfType<ARPlaneManager>();
+            }
+
+            if (planeManager == null)
+            {
+                var xrOrigin = GameObject.Find("XR Origin");
+                if (xrOrigin != null)
+                {
+                    planeManager = xrOrigin.GetComponent<ARPlaneManager>();
+                    if (planeManager == null)
+                    {
+                        planeManager = xrOrigin.AddComponent<ARPlaneManager>();
+                    }
+                }
+            }
+
+            if (planeManager != null)
+            {
+                planeManager.requestedDetectionMode = PlaneDetectionMode.Horizontal;
+                planeManager.enabled = true;
+            }
         }
 
         private void Update()
         {
-            if (!realtimeYoloEnabled || Time.time - lastRealtimeYoloTime < realtimeYoloIntervalSeconds)
+            if (realtimeYoloEnabled && Time.time - lastRealtimeYoloTime >= realtimeYoloIntervalSeconds)
             {
-                return;
+                lastRealtimeYoloTime = Time.time;
+                hasLatestDetection = TryDetectCenterObject(out latestDetection, true);
             }
 
-            lastRealtimeYoloTime = Time.time;
-            hasLatestDetection = TryDetectCenterObject(out latestDetection, true);
+            if (realtimeDirectionEnabled && Time.time - lastRealtimeDirectionTime >= realtimeDirectionIntervalSeconds)
+            {
+                lastRealtimeDirectionTime = Time.time;
+                UpdateRealtimeDirection();
+            }
         }
 
         private void CapturePointCloud()
@@ -152,7 +206,7 @@ namespace ARObjectReplacement.Demo
                             new Vector2Int(depthFrame.Width, depthFrame.Height)),
                         depthFrame.Width,
                         depthFrame.Height,
-                        0.12f)
+                        yoloRoiExpandRatio)
                     : CreateCenterRoi(depthFrame.Width, depthFrame.Height);
 
                 var rawCloud = builder.BuildPointCloud(
@@ -187,6 +241,12 @@ namespace ARObjectReplacement.Demo
             stopwatch.Stop();
             filteredCloud.ExportTimeMs = (float)exportStopwatch.Elapsed.TotalMilliseconds;
             var displayed = DisplayPointCloud(filteredCloud, cameraManager.transform);
+            var frame = EstimateRuntimePoseFrame(
+                filteredCloud,
+                cameraManager.transform,
+                filteredCloud.Timestamp,
+                out var activeMode);
+            UpdateGenericPoseDisplay(frame, cameraManager.transform, hasDetection ? "YOLO ROI" : "Center ROI", activeMode);
 
             var fps = stopwatch.Elapsed.TotalSeconds > 0 ? 1.0 / stopwatch.Elapsed.TotalSeconds : 0.0;
             var message =
@@ -202,6 +262,285 @@ namespace ARObjectReplacement.Demo
                       $"yolo={(hasDetection ? $"class={detection.ClassId}, confidence={detection.Confidence:F3}, bbox={detection.PixelRect}" : "fallback_center_roi")} " +
                       $"export_time_ms={filteredCloud.ExportTimeMs:F1} capture_time_ms={stopwatch.Elapsed.TotalMilliseconds:F1} " +
                       $"fps={fps:F1} path={path} latest_path={latestPath}");
+        }
+
+        private void UpdateRealtimeDirection()
+        {
+            if (!TryBuildCurrentDirectionCloud(out var pointCloud, out var roiSource))
+            {
+                HideDirectionAxis();
+                HideTargetCenterSphere();
+                SetDirectionText("Direction: waiting for LiDAR ROI");
+                return;
+            }
+
+            var frame = EstimateRuntimePoseFrame(
+                pointCloud,
+                cameraManager != null ? cameraManager.transform : null,
+                pointCloud != null ? pointCloud.Timestamp : Time.timeAsDouble,
+                out var activeMode);
+            UpdateGenericPoseDisplay(frame, cameraManager != null ? cameraManager.transform : null, roiSource, activeMode);
+        }
+
+        private bool TryBuildCurrentDirectionCloud(out PointCloudData filteredCloud, out string roiSource)
+        {
+            filteredCloud = null;
+            roiSource = "Center ROI";
+
+            if (occlusionManager == null || cameraManager == null)
+            {
+                return false;
+            }
+
+            if (!cameraManager.TryGetIntrinsics(out var intrinsics))
+            {
+                return false;
+            }
+
+            if (!occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
+            {
+                return false;
+            }
+
+            var hasDetection = hasLatestDetection && Time.timeAsDouble - latestDetection.Timestamp < 2.0;
+            using (depthImage)
+            {
+                using var confidenceImage = TryAcquireConfidenceImage();
+                var depthFrame = CreateDepthFrame(depthImage, confidenceImage);
+                var roi = hasDetection
+                    ? BoundingBoxMapper.ExpandAndClip(
+                        BoundingBoxMapper.ScreenRectToImageRoi(
+                            latestDetection.PixelRect,
+                            new Vector2Int(Screen.width, Screen.height),
+                            new Vector2Int(depthFrame.Width, depthFrame.Height)),
+                        depthFrame.Width,
+                        depthFrame.Height,
+                        yoloRoiExpandRatio)
+                    : CreateCenterRoi(depthFrame.Width, depthFrame.Height);
+
+                roiSource = hasDetection ? "YOLO ROI" : "Center ROI";
+                var rawCloud = builder.BuildPointCloud(
+                    depthFrame,
+                    roi,
+                    intrinsics,
+                    minDepthMeters,
+                    maxDepthMeters,
+                    minimumConfidence);
+
+                var cleaned = cleaner.RemoveInvalidAndOutOfRange(
+                    rawCloud,
+                    minDepthMeters,
+                    maxDepthMeters,
+                    minimumConfidence);
+
+                var downsampled = downSampler.VoxelDownSample(cleaned, voxelSizeMeters);
+                filteredCloud = cleaner.RadiusOutlierRemoval(
+                    downsampled,
+                    outlierRadiusMeters,
+                    outlierMinimumNeighbors);
+                filteredCloud.VoxelSizeMeters = voxelSizeMeters;
+                return filteredCloud.Points != null && filteredCloud.Points.Count > 0;
+            }
+        }
+
+        private GenericPoseFrame EstimateRuntimePoseFrame(
+            PointCloudData pointCloud,
+            Transform cameraTransform,
+            double timestamp,
+            out RuntimePoseMode activeMode)
+        {
+            var worldUpCamera = cameraTransform != null
+                ? cameraTransform.InverseTransformDirection(Vector3.up).normalized
+                : Vector3.up;
+            var rawFrame = genericPoseEstimator.Estimate(pointCloud, genericPoseConfig, worldUpCamera, timestamp);
+            var freeFrame = genericPoseStabilizer.Update(rawFrame, genericPoseConfig, timestamp);
+            var hasSupportPlane = TryFindSupportingHorizontalPlane(
+                freeFrame,
+                cameraTransform,
+                out var supportPlaneUpCamera,
+                out var supportPlaneHeight);
+            activeMode = ResolveActivePoseMode(freeFrame, hasSupportPlane);
+            return activeMode == RuntimePoseMode.SurfaceObject
+                ? BuildSurfaceObjectFrame(
+                    freeFrame,
+                    hasSupportPlane ? supportPlaneUpCamera : worldUpCamera,
+                    hasSupportPlane,
+                    supportPlaneHeight)
+                : freeFrame;
+        }
+
+        private RuntimePoseMode ResolveActivePoseMode(GenericPoseFrame frame, bool hasSupportPlane)
+        {
+            if (runtimePoseMode == RuntimePoseMode.SurfaceObject ||
+                runtimePoseMode == RuntimePoseMode.FreeObject)
+            {
+                return runtimePoseMode;
+            }
+
+            if (hasSupportPlane)
+            {
+                return RuntimePoseMode.SurfaceObject;
+            }
+
+            if (!frame.IsValid || frame.Stability == GenericPoseStability.TrackingLost)
+            {
+                return RuntimePoseMode.SurfaceObject;
+            }
+
+            var freeShape = frame.ShapeType == GenericShapeType.Elongated ||
+                            frame.ShapeType == GenericShapeType.BoxLike;
+            var freeConfidence = frame.OverallConfidence >= genericPoseConfig.AutoFreeObjectConfidenceThreshold;
+            var enoughThickness = frame.Scattering >= genericPoseConfig.AutoFreeObjectMinimumScattering;
+            var notDominatedByPlane = frame.Planarity <= genericPoseConfig.AutoFreeObjectMaximumPlanarity;
+            return freeShape && freeConfidence && enoughThickness && notDominatedByPlane
+                ? RuntimePoseMode.FreeObject
+                : RuntimePoseMode.SurfaceObject;
+        }
+
+        private bool TryFindSupportingHorizontalPlane(
+            GenericPoseFrame frame,
+            Transform cameraTransform,
+            out Vector3 planeUpCamera,
+            out float heightMeters)
+        {
+            planeUpCamera = Vector3.up;
+            heightMeters = 0f;
+            if (planeManager == null ||
+                cameraTransform == null ||
+                (!frame.IsValid && frame.Stability != GenericPoseStability.TrackingLost))
+            {
+                return false;
+            }
+
+            var centerWorld = cameraTransform.TransformPoint(frame.CenterCamera);
+            var bestScore = float.PositiveInfinity;
+            var bestNormalWorld = Vector3.up;
+            var bestHeight = 0f;
+
+            foreach (var plane in planeManager.trackables)
+            {
+                if (plane == null ||
+                    plane.trackingState != TrackingState.Tracking ||
+                    plane.alignment != PlaneAlignment.HorizontalUp)
+                {
+                    continue;
+                }
+
+                var normalWorld = plane.transform.up.normalized;
+                if (Vector3.Dot(normalWorld, Vector3.up) < genericPoseConfig.SurfacePlaneNormalUpDotThreshold)
+                {
+                    continue;
+                }
+
+                var planeCenter = plane.transform.position;
+                var height = Vector3.Dot(centerWorld - planeCenter, normalWorld);
+                if (height < genericPoseConfig.SurfacePlaneMinimumHeightMeters ||
+                    height > genericPoseConfig.SurfacePlaneMaximumHeightMeters)
+                {
+                    continue;
+                }
+
+                var horizontalOffset = Vector3.ProjectOnPlane(centerWorld - planeCenter, normalWorld).magnitude;
+                var size = plane.size;
+                var allowedOffset = Mathf.Max(size.x, size.y) * 0.5f + genericPoseConfig.SurfacePlaneHorizontalMarginMeters;
+                if (horizontalOffset > allowedOffset)
+                {
+                    continue;
+                }
+
+                var score = height + horizontalOffset * 0.25f;
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestNormalWorld = normalWorld;
+                    bestHeight = height;
+                }
+            }
+
+            if (float.IsPositiveInfinity(bestScore))
+            {
+                return false;
+            }
+
+            planeUpCamera = cameraTransform.InverseTransformDirection(bestNormalWorld).normalized;
+            heightMeters = bestHeight;
+            return true;
+        }
+
+        private GenericPoseFrame BuildSurfaceObjectFrame(
+            GenericPoseFrame source,
+            Vector3 surfaceUpCamera,
+            bool hasSupportPlane,
+            float supportPlaneHeightMeters)
+        {
+            if (!source.IsValid && source.Stability != GenericPoseStability.TrackingLost)
+            {
+                return source;
+            }
+
+            var up = GenericPoseMath.SafeNormalize(surfaceUpCamera, Vector3.up);
+            var faceCandidate = surfaceForwardFacesCamera ? Vector3.back : Vector3.forward;
+            var fallback = Mathf.Abs(Vector3.Dot(source.AxisMajorCamera, up)) < genericPoseConfig.ParallelDirectionThreshold
+                ? source.AxisMajorCamera
+                : source.AxisMiddleCamera;
+            GenericPoseMath.BuildOrthonormalFrame(
+                faceCandidate,
+                up,
+                fallback,
+                genericPoseConfig.ParallelDirectionThreshold,
+                out var right,
+                out up,
+                out var forward);
+
+            source.RightCamera = right;
+            source.UpCamera = up;
+            source.ForwardCamera = forward;
+            source.OrientationConfidence = 1f;
+            source.OverallConfidence = GenericPoseMath.Clamp01Safe(
+                0.55f * source.GeometryConfidence + 0.45f * source.TrackingConfidence);
+            source.Stability = source.OverallConfidence >= genericPoseConfig.StableConfidenceThreshold
+                ? GenericPoseStability.Stable
+                : source.OverallConfidence >= genericPoseConfig.WeakConfidenceThreshold
+                    ? GenericPoseStability.Weak
+                    : GenericPoseStability.Unreliable;
+            if (source.ShapeType == GenericShapeType.Unknown)
+            {
+                source.ShapeType = GenericShapeType.Planar;
+            }
+            var supportLabel = hasSupportPlane
+                ? $"ARPlane support height={supportPlaneHeightMeters:F2}m"
+                : "world-up fallback";
+            source.Message = surfaceForwardFacesCamera
+                ? $"SurfaceObject: center + {supportLabel} + face camera"
+                : $"SurfaceObject: center + {supportLabel} + camera direction";
+            return source;
+        }
+
+        private void UpdateGenericPoseDisplay(GenericPoseFrame frame, Transform cameraTransform, string roiSource, RuntimePoseMode activeMode)
+        {
+            if ((!frame.IsValid && frame.Stability != GenericPoseStability.TrackingLost) || cameraTransform == null)
+            {
+                HideDirectionAxis();
+                HideTargetCenterSphere();
+                SetDirectionText($"{frame.Message}\nsource={roiSource}, points={frame.PointCount}");
+                return;
+            }
+
+            DisplayTargetCenterSphere(frame, cameraTransform);
+            DisplayGenericPoseAxis(frame, cameraTransform);
+            SetDirectionText(
+                $"Pose {activeMode} {roiSource}\n" +
+                $"shape={frame.ShapeType}, status={frame.Stability}, overall={frame.OverallConfidence:F2}\n" +
+                $"geo={frame.GeometryConfidence:F2}, orient={frame.OrientationConfidence:F2}, track={frame.TrackingConfidence:F2}, points={frame.PointCount}\n" +
+                $"extent={frame.ExtentMeters.x:F2}/{frame.ExtentMeters.y:F2}/{frame.ExtentMeters.z:F2}m\n" +
+                $"right={FormatVector(frame.RightCamera)}\n" +
+                $"up={FormatVector(frame.UpCamera)}\n" +
+                $"forward={FormatVector(frame.ForwardCamera)}\n" +
+                $"{frame.Message}" +
+                (genericPoseConfig.ShowDebugPcaValues
+                    ? $"\nlin/plan/scat={frame.Linearity:F2}/{frame.Planarity:F2}/{frame.Scattering:F2}"
+                    : string.Empty));
+            LogGenericPoseFrame(frame, roiSource, activeMode);
         }
 
         private bool TryDetectCenterObject(out DetectionResult detection, bool updateOverlay)
@@ -390,6 +729,164 @@ namespace ARObjectReplacement.Demo
             return material;
         }
 
+        private void DisplayGenericPoseAxis(GenericPoseFrame frame, Transform cameraTransform)
+        {
+            EnsureDirectionAxisVisual();
+
+            var center = cameraTransform.TransformPoint(frame.CenterCamera);
+            var length = ComputeAxisLength(frame);
+            var rightEnd = center + cameraTransform.TransformDirection(frame.RightCamera).normalized * length;
+            var upEnd = center + cameraTransform.TransformDirection(frame.UpCamera).normalized * length;
+            var forwardEnd = center + cameraTransform.TransformDirection(frame.ForwardCamera).normalized * length;
+
+            SetAxisLine(directionAxisMajor, center, rightEnd);
+            SetAxisLine(directionAxisMiddle, center, upEnd);
+            SetAxisLine(directionAxisNormal, center, forwardEnd);
+            directionAxisRoot.SetActive(true);
+        }
+
+        private void EnsureDirectionAxisVisual()
+        {
+            if (directionAxisRoot != null)
+            {
+                return;
+            }
+
+            directionAxisRoot = new GameObject("M5 Runtime Direction Axis");
+            directionAxisMajor = CreateAxisLine(directionAxisRoot.transform, "Generic Right", Color.red);
+            directionAxisMiddle = CreateAxisLine(directionAxisRoot.transform, "Generic Up", Color.green);
+            directionAxisNormal = CreateAxisLine(directionAxisRoot.transform, "Generic Forward", Color.blue);
+            directionAxisRoot.SetActive(false);
+            DontDestroyOnLoad(directionAxisRoot);
+        }
+
+        private LineRenderer CreateAxisLine(Transform parent, string name, Color color)
+        {
+            var axisObject = new GameObject(name);
+            axisObject.transform.SetParent(parent, false);
+            var line = axisObject.AddComponent<LineRenderer>();
+            line.positionCount = 2;
+            line.useWorldSpace = true;
+            line.startWidth = directionAxisThicknessMeters;
+            line.endWidth = directionAxisThicknessMeters;
+            line.numCapVertices = 6;
+            line.material = CreateAxisMaterial(color);
+            line.startColor = color;
+            line.endColor = color;
+            return line;
+        }
+
+        private static Material CreateAxisMaterial(Color color)
+        {
+            var shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+            {
+                shader = Shader.Find("Unlit/Color");
+            }
+
+            if (shader == null)
+            {
+                shader = Shader.Find("Standard");
+            }
+
+            var material = shader != null ? new Material(shader) : null;
+            if (material != null)
+            {
+                material.color = color;
+            }
+            return material;
+        }
+
+        private static void SetAxisLine(LineRenderer line, Vector3 start, Vector3 end)
+        {
+            if (line == null)
+            {
+                return;
+            }
+
+            line.SetPosition(0, start);
+            line.SetPosition(1, end);
+        }
+
+        private void HideDirectionAxis()
+        {
+            if (directionAxisRoot != null)
+            {
+                directionAxisRoot.SetActive(false);
+            }
+        }
+
+        private void DisplayTargetCenterSphere(GenericPoseFrame frame, Transform cameraTransform)
+        {
+            EnsureTargetCenterSphere();
+            targetCenterSphere.transform.position = cameraTransform.TransformPoint(frame.CenterCamera);
+            targetCenterSphere.transform.localScale = Vector3.one * Mathf.Max(0.005f, targetCenterSphereDiameterMeters);
+            if (!targetCenterSphere.activeSelf)
+            {
+                targetCenterSphere.SetActive(true);
+            }
+        }
+
+        private void EnsureTargetCenterSphere()
+        {
+            if (targetCenterSphere != null)
+            {
+                return;
+            }
+
+            targetCenterSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            targetCenterSphere.name = "M5 Target Center Sphere";
+            targetCenterSphereRenderer = targetCenterSphere.GetComponent<MeshRenderer>();
+            if (targetCenterSphereRenderer != null)
+            {
+                targetCenterSphereRenderer.sharedMaterial = CreateTargetCenterSphereMaterial();
+            }
+
+            targetCenterSphere.SetActive(false);
+            DontDestroyOnLoad(targetCenterSphere);
+        }
+
+        private static Material CreateTargetCenterSphereMaterial()
+        {
+            var shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+            {
+                shader = Shader.Find("Unlit/Color");
+            }
+
+            if (shader == null)
+            {
+                shader = Shader.Find("Standard");
+            }
+
+            if (shader == null)
+            {
+                return null;
+            }
+
+            var material = new Material(shader);
+            material.color = new Color(1f, 0.88f, 0.05f, 1f);
+            return material;
+        }
+
+        private void HideTargetCenterSphere()
+        {
+            if (targetCenterSphere != null && targetCenterSphere.activeSelf)
+            {
+                targetCenterSphere.SetActive(false);
+            }
+        }
+
+        private float ComputeAxisLength(GenericPoseFrame frame)
+        {
+            var extentMax = Mathf.Max(frame.ExtentMeters.x, Mathf.Max(frame.ExtentMeters.y, frame.ExtentMeters.z));
+            var adaptive = extentMax > 0f ? extentMax * 0.65f : directionAxisLengthMeters;
+            return Mathf.Clamp(
+                adaptive,
+                genericPoseConfig != null ? genericPoseConfig.MinimumAxisLengthMeters : 0.03f,
+                genericPoseConfig != null ? genericPoseConfig.MaximumAxisLengthMeters : 0.20f);
+        }
+
         private XRCpuImage TryAcquireConfidenceImage()
         {
             if (occlusionManager != null &&
@@ -512,8 +1009,10 @@ namespace ARObjectReplacement.Demo
             button.onClick.AddListener(CapturePointCloud);
 
             statusText = CreateStatusText(canvas.transform);
+            directionText = CreateDirectionText(canvas.transform);
             CreateDetectionBox(canvas.transform);
             SetDetectionLabel("YOLO starting...");
+            SetDirectionText("Direction: waiting");
         }
 
         private static void EnsureEventSystem()
@@ -583,6 +1082,26 @@ namespace ARObjectReplacement.Demo
             rect.pivot = new Vector2(0f, 0f);
             rect.anchoredPosition = new Vector2(480f, 410f);
             rect.sizeDelta = new Vector2(650f, 180f);
+            return text;
+        }
+
+        private static Text CreateDirectionText(Transform parent)
+        {
+            var textObject = new GameObject("M5 Runtime Direction Status");
+            textObject.transform.SetParent(parent, false);
+            var text = textObject.AddComponent<Text>();
+            text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            text.fontSize = 24;
+            text.alignment = TextAnchor.UpperLeft;
+            text.color = new Color(1f, 1f, 1f, 0.96f);
+            text.text = "Direction: waiting";
+
+            var rect = text.rectTransform;
+            rect.anchorMin = new Vector2(0f, 0f);
+            rect.anchorMax = new Vector2(0f, 0f);
+            rect.pivot = new Vector2(0f, 0f);
+            rect.anchoredPosition = new Vector2(32f, 600f);
+            rect.sizeDelta = new Vector2(760f, 220f);
             return text;
         }
 
@@ -677,6 +1196,40 @@ namespace ARObjectReplacement.Demo
             }
 
             Debug.Log($"[M4 PointCloud] {status}");
+        }
+
+        private void SetDirectionText(string text)
+        {
+            if (directionText != null)
+            {
+                directionText.text = text;
+            }
+        }
+
+        private void LogGenericPoseFrame(GenericPoseFrame frame, string roiSource, RuntimePoseMode activeMode)
+        {
+            if (genericPoseConfig != null &&
+                Time.time - lastGenericPoseLogTime < genericPoseConfig.LogIntervalSeconds)
+            {
+                return;
+            }
+
+            lastGenericPoseLogTime = Time.time;
+            Debug.Log(
+                $"[M5 RuntimePose] mode={activeMode} source={roiSource.Replace(' ', '_')} " +
+                $"shape={frame.ShapeType} status={frame.Stability} points={frame.PointCount} " +
+                $"confidence={frame.OverallConfidence:F2} geometry={frame.GeometryConfidence:F2} " +
+                $"orientation={frame.OrientationConfidence:F2} tracking={frame.TrackingConfidence:F2} " +
+                $"linearity={frame.Linearity:F2} planarity={frame.Planarity:F2} scattering={frame.Scattering:F2} " +
+                $"center={FormatVector(frame.CenterCamera)} right={FormatVector(frame.RightCamera)} " +
+                $"up={FormatVector(frame.UpCamera)} forward={FormatVector(frame.ForwardCamera)} " +
+                $"extent=({frame.ExtentMeters.x:F3}, {frame.ExtentMeters.y:F3}, {frame.ExtentMeters.z:F3}) " +
+                $"message=\"{frame.Message}\"");
+        }
+
+        private static string FormatVector(Vector3 vector)
+        {
+            return $"({vector.x:+0.00;-0.00;0.00}, {vector.y:+0.00;-0.00;0.00}, {vector.z:+0.00;-0.00;0.00})";
         }
     }
 }

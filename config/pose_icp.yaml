@@ -1,0 +1,50 @@
+coordinate_frame: camera
+transform_semantics: T_camera_from_model
+
+scene:
+  voxel_size: 0.005
+  normal_radius: 0.03
+  normal_max_nn: 30
+  statistical_filter:
+    enabled: true
+    nb_neighbors: 20
+    std_ratio: 2.0
+  radius_filter:
+    enabled: false
+    nb_points: 8
+    radius: 0.03
+
+model:
+  unit: meter
+  origin: centroid
+  forward_axis: "+Z"
+  up_axis: "+Y"
+  voxel_size: 0.005
+  normal_radius: 0.03
+  normal_max_nn: 30
+  statistical_filter:
+    enabled: false
+    nb_neighbors: 20
+    std_ratio: 2.0
+  radius_filter:
+    enabled: false
+    nb_points: 8
+    radius: 0.03
+
+initialization:
+  method: centroid_pca
+  pca_sign_disambiguation: true
+
+icp:
+  point_to_point:
+    enabled: true
+    correspondence_threshold: 0.04
+    max_iteration: 80
+  point_to_plane:
+    enabled: true
+    correspondence_threshold: 0.025
+    max_iteration: 50
+
+acceptance:
+  min_points: 30
+  max_inlier_rmse: 0.04

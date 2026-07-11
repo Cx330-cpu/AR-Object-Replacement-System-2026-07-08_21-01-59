@@ -8,6 +8,8 @@ namespace ARObjectReplacement.Geometry
 {
     public sealed class GeometrySphereDemo : MonoBehaviour
     {
+        private static readonly bool AutoInstallEnabled = false;
+
         [SerializeField] private ARDepthCrosshairMeasure depthMeasure;
         [SerializeField] private Camera arCamera;
         [SerializeField] private float sphereDiameterMeters = 0.06f;
@@ -28,6 +30,11 @@ namespace ARObjectReplacement.Geometry
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Install()
         {
+            if (!AutoInstallEnabled)
+            {
+                return;
+            }
+
             var camera = Camera.main;
             if (camera == null)
             {
