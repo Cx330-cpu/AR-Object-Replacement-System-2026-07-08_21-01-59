@@ -26,6 +26,25 @@ namespace ARObjectReplacement.Detection
             float iouThreshold,
             out DetectionResult result)
         {
+            return TryDetectCenterObject(
+                rgbaBytes,
+                imageWidth,
+                imageHeight,
+                confidenceThreshold,
+                iouThreshold,
+                -1,
+                out result);
+        }
+
+        public bool TryDetectCenterObject(
+            byte[] rgbaBytes,
+            int imageWidth,
+            int imageHeight,
+            float confidenceThreshold,
+            float iouThreshold,
+            int preferredClassId,
+            out DetectionResult result)
+        {
             result = default;
 #if UNITY_IOS && !UNITY_EDITOR
             if (rgbaBytes == null || rgbaBytes.Length < imageWidth * imageHeight * 4)
@@ -42,12 +61,19 @@ namespace ARObjectReplacement.Detection
                 Screen.height,
                 confidenceThreshold,
                 iouThreshold,
+                preferredClassId,
                 out var x,
                 out var y,
                 out var width,
                 out var height,
                 out var classId,
-                out var confidence);
+                out var confidence,
+                out var hasMaskBottomCenter,
+                out var maskBottomCenterX,
+                out var maskBottomCenterY,
+                out var hasMaskCenter,
+                out var maskCenterX,
+                out var maskCenterY);
 
             if (!success)
             {
@@ -60,7 +86,11 @@ namespace ARObjectReplacement.Detection
                 PixelRect = new Rect(x, y, width, height),
                 ClassId = classId,
                 Confidence = confidence,
-                Timestamp = Time.timeAsDouble
+                Timestamp = Time.timeAsDouble,
+                HasMaskBottomCenter = hasMaskBottomCenter != 0,
+                MaskBottomCenter = new Vector2(maskBottomCenterX, maskBottomCenterY),
+                HasMaskCenter = hasMaskCenter != 0,
+                MaskCenter = new Vector2(maskCenterX, maskCenterY)
             };
             return true;
 #else
@@ -84,12 +114,19 @@ namespace ARObjectReplacement.Detection
             int screenHeight,
             float confidenceThreshold,
             float iouThreshold,
+            int preferredClassId,
             out float x,
             out float y,
             out float width,
             out float height,
             out int classId,
-            out float confidence);
+            out float confidence,
+            out int hasMaskBottomCenter,
+            out float maskBottomCenterX,
+            out float maskBottomCenterY,
+            out int hasMaskCenter,
+            out float maskCenterX,
+            out float maskCenterY);
 #endif
     }
 }

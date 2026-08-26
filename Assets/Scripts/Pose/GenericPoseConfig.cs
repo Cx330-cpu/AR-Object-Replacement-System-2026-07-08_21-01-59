@@ -5,7 +5,7 @@ namespace ARObjectReplacement.Pose
     [Serializable]
     public sealed class GenericPoseConfig
     {
-        public int MinimumPointCount = 30;
+        public int MinimumPointCount = 12;
         public float ElongatedLinearityThreshold = 0.45f;
         public float PlanarPlanarityThreshold = 0.35f;
         public float AmbiguousScatteringThreshold = 0.25f;

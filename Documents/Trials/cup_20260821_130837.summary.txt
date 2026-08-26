@@ -1,0 +1,9 @@
+trial_id=cup_20260821_130837
+object=cup
+frames=28
+class_match_count=28
+class_match_rate_pct=100.0
+success_count=28
+success_rate_pct=100.0
+csv_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/Trials/cup_20260821_130837.csv
+stopped_at=2026-08-21 13:08:48

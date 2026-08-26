@@ -1,0 +1,5 @@
+trial_id=laptop_20260821_131015
+recording=no
+csv_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/Trials/laptop_20260821_131015.csv
+summary_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/Trials/laptop_20260821_131015.summary.txt
+frames=43

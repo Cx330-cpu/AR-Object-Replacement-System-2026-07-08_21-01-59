@@ -1,0 +1,9 @@
+trial_id=laptop_20260821_131015
+object=laptop
+frames=43
+class_match_count=43
+class_match_rate_pct=100.0
+success_count=43
+success_rate_pct=100.0
+csv_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/Trials/laptop_20260821_131015.csv
+stopped_at=2026-08-21 13:10:32

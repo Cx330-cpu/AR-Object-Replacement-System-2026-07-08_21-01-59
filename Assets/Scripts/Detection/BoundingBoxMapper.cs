@@ -24,10 +24,14 @@ namespace ARObjectReplacement.Detection
             return new RectInt(xMin, yMin, xMax - xMin, yMax - yMin);
         }
 
-        public static RectInt ExpandAndClip(RectInt roi, int width, int height, float expandRatio)
+        public static RectInt ExpandAndClip(RectInt roi, int width, int height, float expandRatio, int minExpandPixels = 0)
         {
-            var expandX = Mathf.RoundToInt(roi.width * Mathf.Max(0f, expandRatio) * 0.5f);
-            var expandY = Mathf.RoundToInt(roi.height * Mathf.Max(0f, expandRatio) * 0.5f);
+            var expandX = Mathf.Max(
+                minExpandPixels,
+                Mathf.RoundToInt(roi.width * Mathf.Max(0f, expandRatio) * 0.5f));
+            var expandY = Mathf.Max(
+                minExpandPixels,
+                Mathf.RoundToInt(roi.height * Mathf.Max(0f, expandRatio) * 0.5f));
             var xMin = Mathf.Clamp(roi.xMin - expandX, 0, width);
             var yMin = Mathf.Clamp(roi.yMin - expandY, 0, height);
             var xMax = Mathf.Clamp(roi.xMax + expandX, xMin + 1, width);

@@ -1,0 +1,9 @@
+trial_id=phone_20260821_130948
+object=phone
+frames=27
+class_match_count=27
+class_match_rate_pct=100.0
+success_count=26
+success_rate_pct=96.3
+csv_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/Trials/phone_20260821_130948.csv
+stopped_at=2026-08-21 13:10:00

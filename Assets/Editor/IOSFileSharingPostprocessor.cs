@@ -16,7 +16,9 @@ namespace ARObjectReplacement.Editor
             }
 
             EnableFileSharing(pathToBuiltProject);
-            AddYoloModelToXcodeProject(pathToBuiltProject);
+            AddYoloModelsToStreamingAssets(pathToBuiltProject);
+            AddReplacementModelsToStreamingAssets(pathToBuiltProject);
+            AddNativeFrameworks(pathToBuiltProject);
         }
 
         private static void EnableFileSharing(string pathToBuiltProject)
@@ -32,12 +34,42 @@ namespace ARObjectReplacement.Editor
             plist.WriteToFile(plistPath);
         }
 
-        private static void AddYoloModelToXcodeProject(string pathToBuiltProject)
+        private static void AddNativeFrameworks(string pathToBuiltProject)
         {
-            var sourceModelPath = Path.Combine(Directory.GetCurrentDirectory(), "Assets", "StreamingAssets", "yolov8n.mlpackage");
+            var projectPath = PBXProject.GetPBXProjectPath(pathToBuiltProject);
+            var project = new PBXProject();
+            project.ReadFromFile(projectPath);
+
+            var frameworkTargetGuid = project.GetUnityFrameworkTargetGuid();
+            AddFrameworkIfMissing(project, frameworkTargetGuid, "CoreML.framework");
+            AddFrameworkIfMissing(project, frameworkTargetGuid, "Vision.framework");
+            AddFrameworkIfMissing(project, frameworkTargetGuid, "CoreVideo.framework");
+
+            project.WriteToFile(projectPath);
+        }
+
+        private static void AddFrameworkIfMissing(PBXProject project, string targetGuid, string framework)
+        {
+            if (string.IsNullOrEmpty(targetGuid) || project.ContainsFramework(targetGuid, framework))
+            {
+                return;
+            }
+
+            project.AddFrameworkToProject(targetGuid, framework, false);
+        }
+
+        private static void AddYoloModelsToStreamingAssets(string pathToBuiltProject)
+        {
+            CopyYoloModelToStreamingAssets(pathToBuiltProject, "yolov8n-seg.mlpackage");
+            CopyYoloModelToStreamingAssets(pathToBuiltProject, "yolov8n.mlpackage");
+        }
+
+        private static void CopyYoloModelToStreamingAssets(string pathToBuiltProject, string modelDirectoryName)
+        {
+            var sourceModelPath = Path.Combine(Directory.GetCurrentDirectory(), "Assets", "StreamingAssets", modelDirectoryName);
             if (!Directory.Exists(sourceModelPath))
             {
-                sourceModelPath = Path.Combine(Directory.GetCurrentDirectory(), "Assets", "models", "yolov8n.mlpackage");
+                sourceModelPath = Path.Combine(Directory.GetCurrentDirectory(), "Assets", "models", modelDirectoryName);
             }
 
             if (!Directory.Exists(sourceModelPath))
@@ -47,37 +79,39 @@ namespace ARObjectReplacement.Editor
 
             var streamingRawPath = Path.Combine(pathToBuiltProject, "Data", "Raw");
             Directory.CreateDirectory(streamingRawPath);
-            var streamingModelPath = Path.Combine(streamingRawPath, "yolov8n.mlpackage");
+            var streamingModelPath = Path.Combine(streamingRawPath, modelDirectoryName);
             if (Directory.Exists(streamingModelPath))
             {
                 Directory.Delete(streamingModelPath, true);
             }
 
             CopyDirectory(sourceModelPath, streamingModelPath);
+        }
 
-            var destinationModelPath = Path.Combine(pathToBuiltProject, "yolov8n.mlpackage");
-            if (Directory.Exists(destinationModelPath))
+        private static void AddReplacementModelsToStreamingAssets(string pathToBuiltProject)
+        {
+            var sourceDirectory = Path.Combine(
+                Directory.GetCurrentDirectory(),
+                "Assets",
+                "Resources",
+                "ReplacementModels");
+            if (!Directory.Exists(sourceDirectory))
             {
-                Directory.Delete(destinationModelPath, true);
+                return;
             }
 
-            CopyDirectory(sourceModelPath, destinationModelPath);
+            var destinationDirectory = Path.Combine(
+                pathToBuiltProject,
+                "Data",
+                "Raw",
+                "ReplacementModels");
+            Directory.CreateDirectory(destinationDirectory);
 
-            var projectPath = PBXProject.GetPBXProjectPath(pathToBuiltProject);
-            var project = new PBXProject();
-            project.ReadFromFile(projectPath);
-
-            var mainTargetGuid = project.GetUnityMainTargetGuid();
-            var frameworkTargetGuid = project.GetUnityFrameworkTargetGuid();
-
-            var modelGuid = project.AddFile("yolov8n.mlpackage", "yolov8n.mlpackage", PBXSourceTree.Source);
-            project.AddFileToBuild(mainTargetGuid, modelGuid);
-
-            project.AddFrameworkToProject(frameworkTargetGuid, "CoreML.framework", false);
-            project.AddFrameworkToProject(frameworkTargetGuid, "Vision.framework", false);
-            project.AddFrameworkToProject(frameworkTargetGuid, "CoreVideo.framework", false);
-
-            project.WriteToFile(projectPath);
+            foreach (var sourceFile in Directory.GetFiles(sourceDirectory, "*.glb", SearchOption.TopDirectoryOnly))
+            {
+                var destinationFile = Path.Combine(destinationDirectory, Path.GetFileName(sourceFile));
+                File.Copy(sourceFile, destinationFile, true);
+            }
         }
 
         private static void CopyDirectory(string sourceDirectory, string destinationDirectory)

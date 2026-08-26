@@ -1,9 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using ARObjectReplacement.Detection;
+using ARObjectReplacement.Evaluation;
 using ARObjectReplacement.PointCloud;
 using ARObjectReplacement.Pose;
+using ARObjectReplacement.Rendering;
 using Unity.Collections;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -21,28 +24,36 @@ namespace ARObjectReplacement.Demo
         [SerializeField] private ARCameraManager cameraManager;
         [SerializeField] private AROcclusionManager occlusionManager;
         [SerializeField] private ARPlaneManager planeManager;
+        [SerializeField] private ARRaycastManager raycastManager;
         [SerializeField] private int roiWidth = 120;
         [SerializeField] private int roiHeight = 120;
         [SerializeField] private float voxelSizeMeters = 0.01f;
         [SerializeField] private float minDepthMeters = 0.05f;
         [SerializeField] private float maxDepthMeters = 8f;
-        [SerializeField] private float minimumConfidence = 0.5f;
-        [SerializeField] private float outlierRadiusMeters = 0.035f;
-        [SerializeField] private int outlierMinimumNeighbors = 2;
-        [SerializeField] private float yoloRoiExpandRatio = 0.04f;
+        [SerializeField] private float minimumConfidence = 0.0f;
+        [SerializeField] private float outlierRadiusMeters = 0.05f;
+        [SerializeField] private int outlierMinimumNeighbors = 1;
+        [SerializeField] private float yoloRoiExpandRatio = 0.12f;
+        [SerializeField] private int yoloRoiMinExpandPixels = 16;
+        [SerializeField] private float yoloConfidenceThreshold = 0.12f;
+        [SerializeField] private float yoloDetectionHoldSeconds = 5.0f;
         [SerializeField] private int maxVisualPoints = 2500;
         [SerializeField] private float pointVisualSizeMeters = 0.006f;
         [SerializeField] private bool realtimeYoloEnabled = true;
-        [SerializeField] private float realtimeYoloIntervalSeconds = 0.5f;
+        [SerializeField] private float realtimeYoloIntervalSeconds = 0.25f;
         [SerializeField] private bool realtimeDirectionEnabled = true;
-        [SerializeField] private float realtimeDirectionIntervalSeconds = 0.5f;
+        [SerializeField] private float realtimeDirectionIntervalSeconds = 0.25f;
         [SerializeField] private float directionAxisLengthMeters = 0.12f;
         [SerializeField] private float directionAxisThicknessMeters = 0.008f;
         [SerializeField] private float targetCenterSphereDiameterMeters = 0.045f;
-        [SerializeField] private int yoloInputWidth = 640;
-        [SerializeField] private int yoloInputHeight = 480;
+        [SerializeField] private bool replacementModelEnabled = true;
+        [SerializeField] private ReplacementModelRegistry replacementModelRegistry;
+        [SerializeField] private float replacementDefaultScaleMeters = 0.18f;
+        [SerializeField] private int yoloInputWidth = 960;
+        [SerializeField] private int yoloInputHeight = 720;
         [SerializeField] private RuntimePoseMode runtimePoseMode = RuntimePoseMode.Auto;
         [SerializeField] private bool surfaceForwardFacesCamera = true;
+        [SerializeField] private float flatObjectHeightThresholdMeters = 0.08f;
         [SerializeField] private GenericPoseConfig genericPoseConfig = new GenericPoseConfig();
 
         private readonly PointCloudBuilder builder = new PointCloudBuilder();
@@ -52,6 +63,7 @@ namespace ARObjectReplacement.Demo
         private readonly YoloCoreMLDetector detector = new YoloCoreMLDetector();
         private readonly GenericPoseEstimator genericPoseEstimator = new GenericPoseEstimator();
         private readonly GenericPoseStabilizer genericPoseStabilizer = new GenericPoseStabilizer();
+        private ReplacementModelController replacementModelController;
         private Text statusText;
         private Text directionText;
         private GameObject pointCloudVisual;
@@ -64,12 +76,31 @@ namespace ARObjectReplacement.Demo
         private GameObject targetCenterSphere;
         private MeshRenderer targetCenterSphereRenderer;
         private RectTransform detectionBox;
+        private RectTransform detectionAnchorMarker;
         private Text detectionText;
         private bool hasLatestDetection;
         private DetectionResult latestDetection;
         private float lastRealtimeYoloTime;
         private float lastRealtimeDirectionTime;
         private float lastGenericPoseLogTime;
+        private readonly List<ARRaycastHit> planeRaycastHits = new List<ARRaycastHit>();
+        private readonly TrialLogger trialLogger = new TrialLogger();
+        private PoseAnchorSelection latestAnchorSelection;
+        private TrialObjectKind selectedTrialObject = TrialObjectKind.None;
+        private Button cupButton;
+        private Button phoneButton;
+        private Button laptopButton;
+        private Button recordButton;
+        private Text recordButtonLabel;
+        private Text trialStatusText;
+        private float lastDetectMs;
+
+        private struct PoseAnchorSelection
+        {
+            public Vector2 Pixel;
+            public string Label;
+            public bool IsValid;
+        }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Install()
@@ -112,15 +143,41 @@ namespace ARObjectReplacement.Demo
                 occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
             }
 
-            EnsurePlaneManager();
+            replacementModelRegistry = replacementModelRegistry != null
+                ? replacementModelRegistry
+                : FindObjectOfType<ReplacementModelRegistry>();
+            replacementModelController = new ReplacementModelController(
+                "ReplacementModels",
+                replacementDefaultScaleMeters,
+                replacementModelRegistry);
+            EnsurePlaneManagers();
             CreateControls();
+            RefreshTrialUi();
         }
 
-        private void EnsurePlaneManager()
+        private void OnDestroy()
+        {
+            trialLogger?.Stop();
+        }
+
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused)
+            {
+                trialLogger?.Flush();
+            }
+        }
+
+        private void EnsurePlaneManagers()
         {
             if (planeManager == null)
             {
                 planeManager = FindObjectOfType<ARPlaneManager>();
+            }
+
+            if (raycastManager == null)
+            {
+                raycastManager = FindObjectOfType<ARRaycastManager>();
             }
 
             if (planeManager == null)
@@ -136,10 +193,28 @@ namespace ARObjectReplacement.Demo
                 }
             }
 
+            if (raycastManager == null)
+            {
+                var xrOrigin = GameObject.Find("XR Origin");
+                if (xrOrigin != null)
+                {
+                    raycastManager = xrOrigin.GetComponent<ARRaycastManager>();
+                    if (raycastManager == null)
+                    {
+                        raycastManager = xrOrigin.AddComponent<ARRaycastManager>();
+                    }
+                }
+            }
+
             if (planeManager != null)
             {
                 planeManager.requestedDetectionMode = PlaneDetectionMode.Horizontal;
                 planeManager.enabled = true;
+            }
+
+            if (raycastManager != null)
+            {
+                raycastManager.enabled = true;
             }
         }
 
@@ -148,7 +223,9 @@ namespace ARObjectReplacement.Demo
             if (realtimeYoloEnabled && Time.time - lastRealtimeYoloTime >= realtimeYoloIntervalSeconds)
             {
                 lastRealtimeYoloTime = Time.time;
+                var detectWatch = Stopwatch.StartNew();
                 hasLatestDetection = TryDetectCenterObject(out latestDetection, true);
+                lastDetectMs = (float)detectWatch.Elapsed.TotalMilliseconds;
             }
 
             if (realtimeDirectionEnabled && Time.time - lastRealtimeDirectionTime >= realtimeDirectionIntervalSeconds)
@@ -174,7 +251,7 @@ namespace ARObjectReplacement.Demo
                 return;
             }
 
-            var hasDetection = hasLatestDetection && Time.timeAsDouble - latestDetection.Timestamp < 2.0;
+            var hasDetection = HasFreshYoloDetection();
             var detection = latestDetection;
             if (!hasDetection)
             {
@@ -184,6 +261,12 @@ namespace ARObjectReplacement.Demo
                     latestDetection = detection;
                     hasLatestDetection = true;
                 }
+            }
+
+            if (!hasDetection && selectedTrialObject != TrialObjectKind.None)
+            {
+                SetStatus("PointCloud: YOLO 未检出，把物体对准屏幕中心后再试");
+                return;
             }
 
             if (!occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
@@ -199,14 +282,7 @@ namespace ARObjectReplacement.Demo
                 using var confidenceImage = TryAcquireConfidenceImage();
                 var depthFrame = CreateDepthFrame(depthImage, confidenceImage);
                 roi = hasDetection
-                    ? BoundingBoxMapper.ExpandAndClip(
-                        BoundingBoxMapper.ScreenRectToImageRoi(
-                            detection.PixelRect,
-                            new Vector2Int(Screen.width, Screen.height),
-                            new Vector2Int(depthFrame.Width, depthFrame.Height)),
-                        depthFrame.Width,
-                        depthFrame.Height,
-                        yoloRoiExpandRatio)
+                    ? CreateYoloRoi(detection.PixelRect, depthFrame.Width, depthFrame.Height)
                     : CreateCenterRoi(depthFrame.Width, depthFrame.Height);
 
                 var rawCloud = builder.BuildPointCloud(
@@ -245,13 +321,15 @@ namespace ARObjectReplacement.Demo
                 filteredCloud,
                 cameraManager.transform,
                 filteredCloud.Timestamp,
+                hasDetection ? detection : default,
+                hasDetection,
                 out var activeMode);
-            UpdateGenericPoseDisplay(frame, cameraManager.transform, hasDetection ? "YOLO ROI" : "Center ROI", activeMode);
+            UpdateGenericPoseDisplay(frame, cameraManager.transform, hasDetection ? "YOLO ROI" : "Center ROI", activeMode, hasDetection ? detection.ClassId : -1);
 
             var fps = stopwatch.Elapsed.TotalSeconds > 0 ? 1.0 / stopwatch.Elapsed.TotalSeconds : 0.0;
             var message =
                 $"{(displayed ? "PointCloud displayed" : "PointCloud saved, no visible points")}\n" +
-                $"{(hasDetection ? $"YOLO {CocoClassNames.GetName(detection.ClassId)}, conf={detection.Confidence:F2}" : "YOLO unavailable: center ROI fallback")}\n" +
+                $"{(hasDetection ? $"YOLO {CocoClassNames.GetName(detection.ClassId)}, conf={detection.Confidence:F2}, anchor={latestAnchorSelection.Label}" : "YOLO unavailable: center ROI fallback")}\n" +
                 $"raw={filteredCloud.RawPointCount}, filtered={filteredCloud.FilteredPointCount}\n" +
                 $"voxel={voxelSizeMeters:F3}m, export={filteredCloud.ExportTimeMs:F1}ms, fps={fps:F1}\n" +
                 $"latest={latestPath}";
@@ -262,24 +340,84 @@ namespace ARObjectReplacement.Demo
                       $"yolo={(hasDetection ? $"class={detection.ClassId}, confidence={detection.Confidence:F3}, bbox={detection.PixelRect}" : "fallback_center_roi")} " +
                       $"export_time_ms={filteredCloud.ExportTimeMs:F1} capture_time_ms={stopwatch.Elapsed.TotalMilliseconds:F1} " +
                       $"fps={fps:F1} path={path} latest_path={latestPath}");
+            LogTrialFrame(
+                "capture",
+                frame,
+                filteredCloud,
+                hasDetection ? detection : default,
+                hasDetection,
+                hasDetection ? "YOLO ROI" : "Center ROI",
+                activeMode,
+                lastDetectMs,
+                0f,
+                0f,
+                filteredCloud.ExportTimeMs,
+                (float)stopwatch.Elapsed.TotalMilliseconds,
+                path);
         }
 
         private void UpdateRealtimeDirection()
         {
-            if (!TryBuildCurrentDirectionCloud(out var pointCloud, out var roiSource))
+            var e2eWatch = Stopwatch.StartNew();
+            var cloudWatch = Stopwatch.StartNew();
+            var hasCloud = TryBuildCurrentDirectionCloud(out var pointCloud, out var roiSource);
+            var cloudMs = (float)cloudWatch.Elapsed.TotalMilliseconds;
+            if (!hasCloud)
             {
                 HideDirectionAxis();
                 HideTargetCenterSphere();
                 SetDirectionText("Direction: waiting for LiDAR ROI");
+                if (trialLogger.IsRecording)
+                {
+                    LogTrialFrame(
+                        "realtime",
+                        GenericPoseFrame.Invalid("waiting for LiDAR ROI"),
+                        pointCloud,
+                        hasLatestDetection ? latestDetection : default,
+                        HasFreshYoloDetection(),
+                        roiSource,
+                        runtimePoseMode,
+                        lastDetectMs,
+                        cloudMs,
+                        0f,
+                        0f,
+                        (float)e2eWatch.Elapsed.TotalMilliseconds,
+                        string.Empty);
+                }
+
                 return;
             }
 
+            var hasRecentDetection = HasFreshYoloDetection();
+            var poseWatch = Stopwatch.StartNew();
             var frame = EstimateRuntimePoseFrame(
                 pointCloud,
                 cameraManager != null ? cameraManager.transform : null,
                 pointCloud != null ? pointCloud.Timestamp : Time.timeAsDouble,
+                hasRecentDetection ? latestDetection : default,
+                hasRecentDetection,
                 out var activeMode);
-            UpdateGenericPoseDisplay(frame, cameraManager != null ? cameraManager.transform : null, roiSource, activeMode);
+            var poseMs = (float)poseWatch.Elapsed.TotalMilliseconds;
+            UpdateGenericPoseDisplay(
+                frame,
+                cameraManager != null ? cameraManager.transform : null,
+                roiSource,
+                activeMode,
+                hasRecentDetection ? latestDetection.ClassId : -1);
+            LogTrialFrame(
+                "realtime",
+                frame,
+                pointCloud,
+                hasRecentDetection ? latestDetection : default,
+                hasRecentDetection,
+                roiSource,
+                activeMode,
+                lastDetectMs,
+                cloudMs,
+                poseMs,
+                0f,
+                (float)e2eWatch.Elapsed.TotalMilliseconds,
+                string.Empty);
         }
 
         private bool TryBuildCurrentDirectionCloud(out PointCloudData filteredCloud, out string roiSource)
@@ -302,20 +440,19 @@ namespace ARObjectReplacement.Demo
                 return false;
             }
 
-            var hasDetection = hasLatestDetection && Time.timeAsDouble - latestDetection.Timestamp < 2.0;
             using (depthImage)
             {
+                var hasDetection = HasFreshYoloDetection();
+                if (!hasDetection && selectedTrialObject != TrialObjectKind.None)
+                {
+                    roiSource = "YOLO lost";
+                    return false;
+                }
+
                 using var confidenceImage = TryAcquireConfidenceImage();
                 var depthFrame = CreateDepthFrame(depthImage, confidenceImage);
                 var roi = hasDetection
-                    ? BoundingBoxMapper.ExpandAndClip(
-                        BoundingBoxMapper.ScreenRectToImageRoi(
-                            latestDetection.PixelRect,
-                            new Vector2Int(Screen.width, Screen.height),
-                            new Vector2Int(depthFrame.Width, depthFrame.Height)),
-                        depthFrame.Width,
-                        depthFrame.Height,
-                        yoloRoiExpandRatio)
+                    ? CreateYoloRoi(latestDetection.PixelRect, depthFrame.Width, depthFrame.Height)
                     : CreateCenterRoi(depthFrame.Width, depthFrame.Height);
 
                 roiSource = hasDetection ? "YOLO ROI" : "Center ROI";
@@ -347,6 +484,8 @@ namespace ARObjectReplacement.Demo
             PointCloudData pointCloud,
             Transform cameraTransform,
             double timestamp,
+            DetectionResult detection,
+            bool hasDetection,
             out RuntimePoseMode activeMode)
         {
             var worldUpCamera = cameraTransform != null
@@ -358,14 +497,21 @@ namespace ARObjectReplacement.Demo
                 freeFrame,
                 cameraTransform,
                 out var supportPlaneUpCamera,
-                out var supportPlaneHeight);
+                out var supportPlaneHeight,
+                out var supportPlaneId);
             activeMode = ResolveActivePoseMode(freeFrame, hasSupportPlane);
+            var anchorSelection = SelectPoseAnchor(detection, hasDetection, freeFrame, hasSupportPlane, supportPlaneHeight);
+            latestAnchorSelection = anchorSelection;
             return activeMode == RuntimePoseMode.SurfaceObject
                 ? BuildSurfaceObjectFrame(
                     freeFrame,
                     hasSupportPlane ? supportPlaneUpCamera : worldUpCamera,
                     hasSupportPlane,
-                    supportPlaneHeight)
+                    supportPlaneHeight,
+                    supportPlaneId,
+                    anchorSelection.IsValid ? DetectionPixelToUnityScreenPoint(anchorSelection.Pixel) : new Vector2(Screen.width * 0.5f, Screen.height * 0.5f),
+                    anchorSelection.IsValid,
+                    cameraTransform)
                 : freeFrame;
         }
 
@@ -397,14 +543,67 @@ namespace ARObjectReplacement.Demo
                 : RuntimePoseMode.SurfaceObject;
         }
 
+        private PoseAnchorSelection SelectPoseAnchor(
+            DetectionResult detection,
+            bool hasDetection,
+            GenericPoseFrame frame,
+            bool hasSupportPlane,
+            float supportPlaneHeightMeters)
+        {
+            if (!hasDetection || !detection.IsValid)
+            {
+                return default;
+            }
+
+            var isFlatObject = IsFlatSurfaceObject(frame, hasSupportPlane, supportPlaneHeightMeters);
+            if (isFlatObject)
+            {
+                return new PoseAnchorSelection
+                {
+                    Pixel = detection.HasMaskCenter ? detection.MaskCenter : detection.Center,
+                    Label = detection.HasMaskCenter ? "mask center flat" : "bbox center flat",
+                    IsValid = true
+                };
+            }
+
+            return new PoseAnchorSelection
+            {
+                Pixel = detection.HasMaskBottomCenter ? detection.MaskBottomCenter : detection.BottomCenter,
+                Label = detection.HasMaskBottomCenter ? "mask bottom upright" : "bbox bottom upright",
+                IsValid = true
+            };
+        }
+
+        private bool IsFlatSurfaceObject(GenericPoseFrame frame, bool hasSupportPlane, float supportPlaneHeightMeters)
+        {
+            var threshold = Mathf.Max(0.005f, flatObjectHeightThresholdMeters);
+            if (hasSupportPlane && supportPlaneHeightMeters > 0f && supportPlaneHeightMeters <= threshold)
+            {
+                return true;
+            }
+
+            var minExtent = Mathf.Min(frame.ExtentMeters.x, Mathf.Min(frame.ExtentMeters.y, frame.ExtentMeters.z));
+            if (minExtent > 0f && minExtent <= threshold)
+            {
+                return true;
+            }
+
+            var verticalExtent = Mathf.Abs(Vector3.Dot(frame.AxisMajorCamera, frame.UpCamera)) * frame.ExtentMeters.x +
+                                 Mathf.Abs(Vector3.Dot(frame.AxisMiddleCamera, frame.UpCamera)) * frame.ExtentMeters.y +
+                                 Mathf.Abs(Vector3.Dot(frame.AxisNormalCamera, frame.UpCamera)) * frame.ExtentMeters.z;
+            return verticalExtent > 0f && verticalExtent <= threshold;
+        }
+
         private bool TryFindSupportingHorizontalPlane(
             GenericPoseFrame frame,
             Transform cameraTransform,
             out Vector3 planeUpCamera,
-            out float heightMeters)
+            out float heightMeters,
+            out TrackableId planeId)
         {
             planeUpCamera = Vector3.up;
             heightMeters = 0f;
+            planeId = TrackableId.invalidId;
             if (planeManager == null ||
                 cameraTransform == null ||
                 (!frame.IsValid && frame.Stability != GenericPoseStability.TrackingLost))
@@ -416,6 +615,7 @@ namespace ARObjectReplacement.Demo
             var bestScore = float.PositiveInfinity;
             var bestNormalWorld = Vector3.up;
             var bestHeight = 0f;
+            var bestPlaneId = TrackableId.invalidId;
 
             foreach (var plane in planeManager.trackables)
             {
@@ -454,6 +654,7 @@ namespace ARObjectReplacement.Demo
                     bestScore = score;
                     bestNormalWorld = normalWorld;
                     bestHeight = height;
+                    bestPlaneId = plane.trackableId;
                 }
             }
 
@@ -464,6 +665,7 @@ namespace ARObjectReplacement.Demo
 
             planeUpCamera = cameraTransform.InverseTransformDirection(bestNormalWorld).normalized;
             heightMeters = bestHeight;
+            planeId = bestPlaneId;
             return true;
         }
 
@@ -471,7 +673,11 @@ namespace ARObjectReplacement.Demo
             GenericPoseFrame source,
             Vector3 surfaceUpCamera,
             bool hasSupportPlane,
-            float supportPlaneHeightMeters)
+            float supportPlaneHeightMeters,
+            TrackableId supportPlaneId,
+            Vector2 objectScreenPoint,
+            bool hasObjectScreenPoint,
+            Transform cameraTransform)
         {
             if (!source.IsValid && source.Stability != GenericPoseStability.TrackingLost)
             {
@@ -495,6 +701,21 @@ namespace ARObjectReplacement.Demo
             source.RightCamera = right;
             source.UpCamera = up;
             source.ForwardCamera = forward;
+            var usedPlaneRaycastOrigin = false;
+            if (hasObjectScreenPoint &&
+                TryGetPlaneOriginCamera(
+                    objectScreenPoint,
+                    cameraTransform,
+                    hasSupportPlane ? supportPlaneId : TrackableId.invalidId,
+                    out var planeOriginCamera))
+            {
+                source.CenterCamera = planeOriginCamera;
+                usedPlaneRaycastOrigin = true;
+            }
+            else if (hasSupportPlane)
+            {
+                source.CenterCamera -= up * supportPlaneHeightMeters;
+            }
             source.OrientationConfidence = 1f;
             source.OverallConfidence = GenericPoseMath.Clamp01Safe(
                 0.55f * source.GeometryConfidence + 0.45f * source.TrackingConfidence);
@@ -507,36 +728,174 @@ namespace ARObjectReplacement.Demo
             {
                 source.ShapeType = GenericShapeType.Planar;
             }
-            var supportLabel = hasSupportPlane
-                ? $"ARPlane support height={supportPlaneHeightMeters:F2}m"
-                : "world-up fallback";
-            source.Message = surfaceForwardFacesCamera
-                ? $"SurfaceObject: center + {supportLabel} + face camera"
-                : $"SurfaceObject: center + {supportLabel} + camera direction";
+            if (hasSupportPlane)
+            {
+                var originLabel = usedPlaneRaycastOrigin ? "ARRaycast origin" : "height fallback";
+                source.Message = surfaceForwardFacesCamera
+                    ? $"SurfaceObject: {originLabel} + ARPlane height={supportPlaneHeightMeters:F2}m + face camera"
+                    : $"SurfaceObject: {originLabel} + ARPlane height={supportPlaneHeightMeters:F2}m + camera direction";
+            }
+            else if (usedPlaneRaycastOrigin)
+            {
+                source.Message = surfaceForwardFacesCamera
+                    ? "SurfaceObject: anchor ARRaycast origin + face camera"
+                    : "SurfaceObject: anchor ARRaycast origin + camera direction";
+            }
+            else
+            {
+                source.Message = surfaceForwardFacesCamera
+                    ? "SurfaceObject: center + world-up fallback + face camera"
+                    : "SurfaceObject: center + world-up fallback + camera direction";
+            }
             return source;
         }
 
-        private void UpdateGenericPoseDisplay(GenericPoseFrame frame, Transform cameraTransform, string roiSource, RuntimePoseMode activeMode)
+        private bool TryGetPlaneOriginCamera(
+            Vector2 screenPoint,
+            Transform cameraTransform,
+            TrackableId requiredPlaneId,
+            out Vector3 originCamera)
+        {
+            originCamera = Vector3.zero;
+            if (raycastManager == null || cameraTransform == null)
+            {
+                return false;
+            }
+
+            var sampleRadii = new[] { 0f, 16f, 32f, 56f };
+            for (var radiusIndex = 0; radiusIndex < sampleRadii.Length; radiusIndex++)
+            {
+                var radius = sampleRadii[radiusIndex];
+                if (radius <= 0f)
+                {
+                    if (TryGetPlaneOriginCameraAtScreenPoint(screenPoint, cameraTransform, requiredPlaneId, out originCamera))
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+
+                var offsets = new[]
+                {
+                    new Vector2(0f, -radius),
+                    new Vector2(-radius, 0f),
+                    new Vector2(radius, 0f),
+                    new Vector2(0f, radius),
+                    new Vector2(-radius, -radius),
+                    new Vector2(radius, -radius),
+                    new Vector2(-radius, radius),
+                    new Vector2(radius, radius)
+                };
+
+                for (var i = 0; i < offsets.Length; i++)
+                {
+                    var candidate = screenPoint + offsets[i];
+                    candidate.x = Mathf.Clamp(candidate.x, 0f, Screen.width);
+                    candidate.y = Mathf.Clamp(candidate.y, 0f, Screen.height);
+                    if (TryGetPlaneOriginCameraAtScreenPoint(candidate, cameraTransform, requiredPlaneId, out originCamera))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryGetPlaneOriginCameraAtScreenPoint(
+            Vector2 screenPoint,
+            Transform cameraTransform,
+            TrackableId requiredPlaneId,
+            out Vector3 originCamera)
+        {
+            originCamera = Vector3.zero;
+            planeRaycastHits.Clear();
+            var trackableTypes =
+                TrackableType.PlaneWithinPolygon |
+                TrackableType.PlaneWithinBounds |
+                TrackableType.PlaneEstimated;
+            if (!raycastManager.Raycast(screenPoint, planeRaycastHits, trackableTypes))
+            {
+                return false;
+            }
+
+            for (var i = 0; i < planeRaycastHits.Count; i++)
+            {
+                var hit = planeRaycastHits[i];
+                if (requiredPlaneId != TrackableId.invalidId && hit.trackableId != requiredPlaneId)
+                {
+                    continue;
+                }
+
+                var plane = planeManager != null ? planeManager.GetPlane(hit.trackableId) : null;
+                if (plane != null)
+                {
+                    if (plane.trackingState != TrackingState.Tracking ||
+                        plane.alignment != PlaneAlignment.HorizontalUp)
+                    {
+                        continue;
+                    }
+                }
+                else if (Vector3.Dot(hit.pose.up.normalized, Vector3.up) < genericPoseConfig.SurfacePlaneNormalUpDotThreshold)
+                {
+                    continue;
+                }
+
+                originCamera = cameraTransform.InverseTransformPoint(hit.pose.position);
+                return GenericPoseMath.IsFinite(originCamera);
+            }
+
+            return false;
+        }
+
+        private static Vector2 DetectionPixelToUnityScreenPoint(Vector2 detectionPixel)
+        {
+            return new Vector2(
+                detectionPixel.x,
+                Screen.height - detectionPixel.y);
+        }
+
+        private void UpdateGenericPoseDisplay(
+            GenericPoseFrame frame,
+            Transform cameraTransform,
+            string roiSource,
+            RuntimePoseMode activeMode,
+            int classId)
         {
             if ((!frame.IsValid && frame.Stability != GenericPoseStability.TrackingLost) || cameraTransform == null)
             {
                 HideDirectionAxis();
                 HideTargetCenterSphere();
+                replacementModelController?.Hide();
                 SetDirectionText($"{frame.Message}\nsource={roiSource}, points={frame.PointCount}");
                 return;
             }
 
             DisplayTargetCenterSphere(frame, cameraTransform);
             DisplayGenericPoseAxis(frame, cameraTransform);
+            var replacementClassId = ResolveReplacementClassId(classId);
+            if (replacementModelEnabled)
+            {
+                replacementModelController?.UpdateModel(frame, cameraTransform, replacementClassId, activeMode);
+            }
+            else
+            {
+                replacementModelController?.Hide();
+            }
+            var originWorld = cameraTransform.TransformPoint(frame.CenterCamera);
             SetDirectionText(
                 $"Pose {activeMode} {roiSource}\n" +
+                $"{frame.Message}\n" +
                 $"shape={frame.ShapeType}, status={frame.Stability}, overall={frame.OverallConfidence:F2}\n" +
                 $"geo={frame.GeometryConfidence:F2}, orient={frame.OrientationConfidence:F2}, track={frame.TrackingConfidence:F2}, points={frame.PointCount}\n" +
+                $"origin_world={FormatVector(originWorld)}m\n" +
+                $"origin_camera={FormatVector(frame.CenterCamera)}m\n" +
+                $"anchor={(latestAnchorSelection.IsValid ? latestAnchorSelection.Label : "none")}\n" +
                 $"extent={frame.ExtentMeters.x:F2}/{frame.ExtentMeters.y:F2}/{frame.ExtentMeters.z:F2}m\n" +
                 $"right={FormatVector(frame.RightCamera)}\n" +
                 $"up={FormatVector(frame.UpCamera)}\n" +
                 $"forward={FormatVector(frame.ForwardCamera)}\n" +
-                $"{frame.Message}" +
+                $"model={GetReplacementModelLabel()}" +
                 (genericPoseConfig.ShowDebugPcaValues
                     ? $"\nlin/plan/scat={frame.Linearity:F2}/{frame.Planarity:F2}/{frame.Scattering:F2}"
                     : string.Empty));
@@ -587,8 +946,9 @@ namespace ARObjectReplacement.Demo
                         rgbaBytes.ToArray(),
                         outputWidth,
                         outputHeight,
-                        0.25f,
+                        yoloConfidenceThreshold,
                         0.45f,
+                        TrialObjectCatalog.GetForcedClassId(selectedTrialObject),
                         out detection);
 
                     if (success)
@@ -836,6 +1196,12 @@ namespace ARObjectReplacement.Demo
 
             targetCenterSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             targetCenterSphere.name = "M5 Target Center Sphere";
+            var sphereCollider = targetCenterSphere.GetComponent<Collider>();
+            if (sphereCollider != null)
+            {
+                Destroy(sphereCollider);
+            }
+
             targetCenterSphereRenderer = targetCenterSphere.GetComponent<MeshRenderer>();
             if (targetCenterSphereRenderer != null)
             {
@@ -960,6 +1326,25 @@ namespace ARObjectReplacement.Demo
             return offset >= 0 && offset < data.Length ? data[offset] * 0.001f : -1f;
         }
 
+        private bool HasFreshYoloDetection()
+        {
+            return hasLatestDetection &&
+                   Time.timeAsDouble - latestDetection.Timestamp < yoloDetectionHoldSeconds;
+        }
+
+        private RectInt CreateYoloRoi(Rect screenRect, int depthWidth, int depthHeight)
+        {
+            return BoundingBoxMapper.ExpandAndClip(
+                BoundingBoxMapper.ScreenRectToImageRoi(
+                    screenRect,
+                    new Vector2Int(Screen.width, Screen.height),
+                    new Vector2Int(depthWidth, depthHeight)),
+                depthWidth,
+                depthHeight,
+                yoloRoiExpandRatio,
+                yoloRoiMinExpandPixels);
+        }
+
         private RectInt CreateCenterRoi(int width, int height)
         {
             var roiW = Mathf.Clamp(roiWidth, 1, width);
@@ -1008,11 +1393,24 @@ namespace ARObjectReplacement.Demo
             var button = CreateButton(canvas.transform, "Capture PointCloud Button", "捕获并显示点云", new Vector2(32f, 420f));
             button.onClick.AddListener(CapturePointCloud);
 
+            cupButton = CreateButton(canvas.transform, "Trial Cup Button", "杯子", new Vector2(32f, 268f), new Vector2(136f, 88f));
+            cupButton.onClick.AddListener(() => SelectTrialObject(TrialObjectKind.Cup));
+            phoneButton = CreateButton(canvas.transform, "Trial Phone Button", "手机", new Vector2(176f, 268f), new Vector2(136f, 88f));
+            phoneButton.onClick.AddListener(() => SelectTrialObject(TrialObjectKind.Phone));
+            laptopButton = CreateButton(canvas.transform, "Trial Laptop Button", "电脑", new Vector2(320f, 268f), new Vector2(136f, 88f));
+            laptopButton.onClick.AddListener(() => SelectTrialObject(TrialObjectKind.Laptop));
+
+            recordButton = CreateButton(canvas.transform, "Trial Record Button", "开始记录", new Vector2(32f, 140f), new Vector2(420f, 100f));
+            recordButton.onClick.AddListener(ToggleTrialRecording);
+            recordButtonLabel = recordButton.GetComponentInChildren<Text>();
+
             statusText = CreateStatusText(canvas.transform);
             directionText = CreateDirectionText(canvas.transform);
+            trialStatusText = CreateTrialStatusText(canvas.transform);
             CreateDetectionBox(canvas.transform);
             SetDetectionLabel("YOLO starting...");
             SetDirectionText("Direction: waiting");
+            RefreshTrialUi();
         }
 
         private static void EnsureEventSystem()
@@ -1034,6 +1432,11 @@ namespace ARObjectReplacement.Demo
 
         private static Button CreateButton(Transform parent, string name, string label, Vector2 anchoredPosition)
         {
+            return CreateButton(parent, name, label, anchoredPosition, new Vector2(420f, 128f));
+        }
+
+        private static Button CreateButton(Transform parent, string name, string label, Vector2 anchoredPosition, Vector2 size)
+        {
             var buttonObject = new GameObject(name);
             buttonObject.transform.SetParent(parent, false);
 
@@ -1046,13 +1449,13 @@ namespace ARObjectReplacement.Demo
             rect.anchorMax = new Vector2(0f, 0f);
             rect.pivot = new Vector2(0f, 0f);
             rect.anchoredPosition = anchoredPosition;
-            rect.sizeDelta = new Vector2(420f, 128f);
+            rect.sizeDelta = size;
 
             var textObject = new GameObject("Label");
             textObject.transform.SetParent(buttonObject.transform, false);
             var text = textObject.AddComponent<Text>();
             text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-            text.fontSize = 38;
+            text.fontSize = size.y < 110f ? 32 : 38;
             text.alignment = TextAnchor.MiddleCenter;
             text.color = Color.white;
             text.text = label;
@@ -1133,6 +1536,16 @@ namespace ARObjectReplacement.Demo
             labelRect.anchoredPosition = new Vector2(0f, 8f);
             labelRect.sizeDelta = new Vector2(0f, 42f);
 
+            var anchorObject = new GameObject("Anchor Marker");
+            anchorObject.transform.SetParent(boxObject.transform, false);
+            var anchorImage = anchorObject.AddComponent<Image>();
+            anchorImage.color = new Color(1f, 0.05f, 0.95f, 0.95f);
+            detectionAnchorMarker = anchorImage.rectTransform;
+            detectionAnchorMarker.anchorMin = new Vector2(0f, 0f);
+            detectionAnchorMarker.anchorMax = new Vector2(0f, 0f);
+            detectionAnchorMarker.pivot = new Vector2(0.5f, 0.5f);
+            detectionAnchorMarker.sizeDelta = new Vector2(26f, 26f);
+
             boxObject.SetActive(false);
         }
 
@@ -1159,9 +1572,19 @@ namespace ARObjectReplacement.Demo
             var rect = detection.PixelRect;
             detectionBox.anchoredPosition = new Vector2(rect.xMin, Screen.height - rect.yMax);
             detectionBox.sizeDelta = new Vector2(rect.width, rect.height);
+            if (detectionAnchorMarker != null)
+            {
+                var anchorPixel = latestAnchorSelection.IsValid
+                    ? latestAnchorSelection.Pixel
+                    : detection.HasMaskCenter ? detection.MaskCenter : detection.Center;
+                var anchorScreenPoint = DetectionPixelToUnityScreenPoint(anchorPixel);
+                detectionAnchorMarker.anchoredPosition = anchorScreenPoint - detectionBox.anchoredPosition;
+            }
+
             if (detectionText != null)
             {
-                detectionText.text = $"YOLO {CocoClassNames.GetName(detection.ClassId)} {detection.Confidence:F2}";
+                var anchorLabel = latestAnchorSelection.IsValid ? latestAnchorSelection.Label : "anchor pending";
+                detectionText.text = $"YOLO {CocoClassNames.GetName(detection.ClassId)} {detection.Confidence:F2} {anchorLabel}";
             }
 
             detectionBox.gameObject.SetActive(true);
@@ -1204,6 +1627,256 @@ namespace ARObjectReplacement.Demo
             {
                 directionText.text = text;
             }
+        }
+
+        private string GetReplacementModelLabel()
+        {
+            if (replacementModelController == null)
+            {
+                return "none";
+            }
+
+            var state = replacementModelController.IsLoading
+                ? "loading"
+                : replacementModelController.IsUsingSceneRegistry ? "scene"
+                : replacementModelController.HasRealModel ? "real" : "fallback";
+            return $"{replacementModelController.ActiveResourceName ?? "none"} ({state})";
+        }
+
+        private static Text CreateTrialStatusText(Transform parent)
+        {
+            var textObject = new GameObject("Trial Status");
+            textObject.transform.SetParent(parent, false);
+            var text = textObject.AddComponent<Text>();
+            text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            text.fontSize = 26;
+            text.alignment = TextAnchor.UpperLeft;
+            text.color = new Color(1f, 0.92f, 0.45f, 1f);
+            text.text = "试验: 先选杯子/手机/电脑";
+
+            var rect = text.rectTransform;
+            rect.anchorMin = new Vector2(0f, 1f);
+            rect.anchorMax = new Vector2(0f, 1f);
+            rect.pivot = new Vector2(0f, 1f);
+            rect.anchoredPosition = new Vector2(24f, -24f);
+            rect.sizeDelta = new Vector2(900f, 140f);
+            return text;
+        }
+
+        private void SelectTrialObject(TrialObjectKind kind)
+        {
+            if (kind == selectedTrialObject)
+            {
+                SetStatus(trialLogger.IsRecording
+                    ? $"正在记录 {TrialObjectCatalog.GetChineseLabel(kind)}"
+                    : $"已选择 {TrialObjectCatalog.GetChineseLabel(kind)}，对准物体后点开始记录");
+                RefreshTrialUi();
+                return;
+            }
+
+            if (trialLogger.IsRecording)
+            {
+                trialLogger.Stop();
+            }
+
+            selectedTrialObject = kind;
+            RefreshTrialUi();
+            SetStatus($"已选择 {TrialObjectCatalog.GetChineseLabel(kind)}，对准物体后点开始记录");
+        }
+
+        private void ToggleTrialRecording()
+        {
+            if (trialLogger.IsRecording)
+            {
+                trialLogger.Stop();
+                SetStatus($"记录已停止\ncsv={trialLogger.CsvPath}\n用文件App从App的Documents/Trials取出");
+                RefreshTrialUi();
+                return;
+            }
+
+            if (selectedTrialObject == TrialObjectKind.None)
+            {
+                SetStatus("请先选择 杯子 / 手机 / 电脑");
+                return;
+            }
+
+            var trialId = $"{TrialObjectCatalog.GetEnglishName(selectedTrialObject)}_{DateTime.Now:yyyyMMdd_HHmmss}";
+            if (!trialLogger.Start(selectedTrialObject, trialId))
+            {
+                SetStatus("无法开始记录");
+                return;
+            }
+
+            SetStatus($"正在记录 {TrialObjectCatalog.GetChineseLabel(selectedTrialObject)}\n{trialId}");
+            RefreshTrialUi();
+        }
+
+        private void RefreshTrialUi()
+        {
+            HighlightButton(cupButton, selectedTrialObject == TrialObjectKind.Cup);
+            HighlightButton(phoneButton, selectedTrialObject == TrialObjectKind.Phone);
+            HighlightButton(laptopButton, selectedTrialObject == TrialObjectKind.Laptop);
+            if (recordButton != null)
+            {
+                var image = recordButton.GetComponent<Image>();
+                if (image != null)
+                {
+                    image.color = trialLogger.IsRecording
+                        ? new Color(0.72f, 0.12f, 0.12f, 0.92f)
+                        : new Color(0.05f, 0.08f, 0.1f, 0.86f);
+                }
+            }
+
+            if (recordButtonLabel != null)
+            {
+                recordButtonLabel.text = trialLogger.IsRecording ? "停止记录" : "开始记录";
+            }
+
+            if (trialStatusText != null)
+            {
+                var objectLabel = TrialObjectCatalog.GetChineseLabel(selectedTrialObject);
+                if (trialLogger.IsRecording)
+                {
+                    trialStatusText.text =
+                        $"试验: {objectLabel}  记录中  frames={trialLogger.FrameCount}\n" +
+                        $"{trialLogger.TrialId}\n" +
+                        "对准物体，必要时再点“捕获并显示点云”";
+                }
+                else
+                {
+                    trialStatusText.text =
+                        $"试验: {objectLabel}  未记录\n" +
+                        "选择物体 → 开始记录 → 保存CSV到Documents/Trials";
+                }
+            }
+        }
+
+        private static void HighlightButton(Button button, bool selected)
+        {
+            if (button == null)
+            {
+                return;
+            }
+
+            var image = button.GetComponent<Image>();
+            if (image == null)
+            {
+                return;
+            }
+
+            image.color = selected
+                ? new Color(0.08f, 0.42f, 0.78f, 0.94f)
+                : new Color(0.05f, 0.08f, 0.1f, 0.86f);
+        }
+
+        private int ResolveReplacementClassId(int detectedClassId)
+        {
+            return selectedTrialObject == TrialObjectKind.None
+                ? detectedClassId
+                : TrialObjectCatalog.GetForcedClassId(selectedTrialObject);
+        }
+
+        private void LogTrialFrame(
+            string eventType,
+            GenericPoseFrame frame,
+            PointCloudData pointCloud,
+            DetectionResult detection,
+            bool hasDetection,
+            string roiSource,
+            RuntimePoseMode activeMode,
+            float detectMs,
+            float cloudMs,
+            float poseMs,
+            float exportMs,
+            float e2eMs,
+            string plyPath)
+        {
+            if (!trialLogger.IsRecording)
+            {
+                RefreshTrialUi();
+                return;
+            }
+
+            var detectedClassId = hasDetection && detection.IsValid ? detection.ClassId : -1;
+            var classMatch = TrialObjectCatalog.MatchesDetectedClass(selectedTrialObject, detectedClassId);
+            var failReason = BuildFailReason(hasDetection, detection, frame, classMatch);
+            var cameraTransform = cameraManager != null ? cameraManager.transform : null;
+            var centerWorld = cameraTransform != null && frame.IsValid
+                ? cameraTransform.TransformPoint(frame.CenterCamera)
+                : Vector3.zero;
+            trialLogger.Append(new TrialFrameRecord
+            {
+                EventType = eventType,
+                FrameId = trialLogger.FrameCount + 1,
+                UnixTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+                UnityTime = Time.timeAsDouble,
+                ObjectLabel = TrialObjectCatalog.GetEnglishName(selectedTrialObject),
+                ExpectedClassId = TrialObjectCatalog.GetForcedClassId(selectedTrialObject),
+                ExpectedClassName = TrialObjectCatalog.GetExpectedClassName(selectedTrialObject),
+                YoloAvailable = detector.IsAvailable,
+                DetectedClassId = detectedClassId,
+                DetectedClassName = detectedClassId >= 0 ? CocoClassNames.GetName(detectedClassId) : "none",
+                Confidence = hasDetection && detection.IsValid ? detection.Confidence : 0f,
+                ClassMatch = classMatch,
+                RoiSource = roiSource,
+                AnchorLabel = latestAnchorSelection.IsValid ? latestAnchorSelection.Label : "none",
+                RawPoints = pointCloud != null ? pointCloud.RawPointCount : 0,
+                FilteredPoints = pointCloud != null ? pointCloud.FilteredPointCount : 0,
+                VoxelSizeMeters = pointCloud != null ? pointCloud.VoxelSizeMeters : voxelSizeMeters,
+                PoseMode = activeMode.ToString(),
+                Shape = frame.ShapeType.ToString(),
+                Stability = frame.Stability.ToString(),
+                CenterCamera = frame.CenterCamera,
+                CenterWorld = centerWorld,
+                RightCamera = frame.RightCamera,
+                UpCamera = frame.UpCamera,
+                ForwardCamera = frame.ForwardCamera,
+                ExtentMeters = frame.ExtentMeters,
+                GeometryConfidence = frame.GeometryConfidence,
+                OrientationConfidence = frame.OrientationConfidence,
+                TrackingConfidence = frame.TrackingConfidence,
+                OverallConfidence = frame.OverallConfidence,
+                DetectMs = detectMs,
+                CloudMs = cloudMs,
+                PoseMs = poseMs,
+                ExportMs = exportMs,
+                E2eMs = e2eMs,
+                ReplacementEnabled = replacementModelEnabled,
+                ModelName = GetReplacementModelLabel(),
+                PlyPath = plyPath ?? string.Empty,
+                Success = string.IsNullOrEmpty(failReason),
+                FailReason = failReason
+            });
+            RefreshTrialUi();
+        }
+
+        private static string BuildFailReason(
+            bool hasDetection,
+            DetectionResult detection,
+            GenericPoseFrame frame,
+            bool classMatch)
+        {
+            if (!hasDetection || !detection.IsValid)
+            {
+                return "no_detection";
+            }
+
+            if (!classMatch)
+            {
+                return "class_mismatch";
+            }
+
+            if (!frame.IsValid && frame.Stability != GenericPoseStability.TrackingLost)
+            {
+                return string.IsNullOrEmpty(frame.Message) ? "invalid_pose" : frame.Message;
+            }
+
+            if (frame.PointCount < 30)
+            {
+                return "too_few_points";
+            }
+
+            return string.Empty;
         }
 
         private void LogGenericPoseFrame(GenericPoseFrame frame, string roiSource, RuntimePoseMode activeMode)

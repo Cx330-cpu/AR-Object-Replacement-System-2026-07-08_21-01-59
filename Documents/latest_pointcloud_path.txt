@@ -1,0 +1,6 @@
+timestamped_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/PointCloud/pointcloud_20260821_131031.ply
+latest_path=/var/mobile/Containers/Data/Application/3E0B7BD6-BD3D-428C-B868-39476BCA6048/Documents/latest_pointcloud.ply
+raw_points=16881
+filtered_points=3399
+voxel_size_m=0.0100
+timestamp=2026-08-21 13:10:31
