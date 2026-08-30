@@ -46,7 +46,7 @@ namespace ARObjectReplacement.Demo
         [SerializeField] private float directionAxisLengthMeters = 0.12f;
         [SerializeField] private float directionAxisThicknessMeters = 0.008f;
         [SerializeField] private float targetCenterSphereDiameterMeters = 0.045f;
-        [SerializeField] private bool replacementModelEnabled = true;
+        [SerializeField] private bool replacementModelEnabled = false;
         [SerializeField] private ReplacementModelRegistry replacementModelRegistry;
         [SerializeField] private float replacementDefaultScaleMeters = 0.18f;
         [SerializeField] private int yoloInputWidth = 960;
